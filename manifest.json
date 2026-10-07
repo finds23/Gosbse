@@ -1,0 +1,15 @@
+{
+  "name": "PelisGO",
+  "version": "1.0.2",
+  "scrapers": [
+    {
+      "id": "PelisGO",
+      "name": "PelisGO",
+      "description": "Series de pelisgo.online: KeKi, Magi (Filemoon), Voe y Okru",
+      "version": "1.0.2",
+      "filename": "providers/pelisgo.js",
+      "supportedTypes": ["tv"],
+      "enabled": true
+    }
+  ]
+}
