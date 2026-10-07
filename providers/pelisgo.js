@@ -28,7 +28,7 @@ var ENABLED_SOURCES = {
   Voe: true,       // puede dar 403 desde Render
   Okru: true
 };
-var VERSION = "1.0.3";
+var VERSION = "1.0.4";
 var PREFER_FORMAT = "mp4"; // un solo stream por servidor: "mp4" (archivo directo) o "hls"
 var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
@@ -220,6 +220,7 @@ async function pgJson(url, opts) {
 }
 
 var TMDB_YEAR = null;
+var PG_SID = "";
 async function getTMDBTitles(tmdbId) {
   var base = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + TMDB_API_KEY;
   var langs = ["es-MX", "en-US"];
@@ -285,6 +286,7 @@ async function getLinks(episodeId, pageUrl) {
     body: "{}"
   });
   if (!sync.sid) throw new Error("session/sync sin sid");
+  PG_SID = sync.sid;
   var api = PG_BASE + "/api/series/episode/" + episodeId + "/stream";
   var data;
   try {
@@ -296,55 +298,70 @@ async function getLinks(episodeId, pageUrl) {
   return data.links || [];
 }
 
+var kekiState = { p: null };
 async function kekiProbe(url, headers) {
   return withTimeout((async function () {
     var r = await pgFetch(url, { headers: headers });
     var t = await r.text();
-    return { status: r.status, ok: r.ok && /#EXTM3U/.test(t), text: t };
-  })(), 5000, "KeKi m3u8");
+    var srv = "";
+    try { srv = (r.headers && r.headers.get && (r.headers.get("server") || r.headers.get("x-served-by"))) || ""; } catch (e) { /* sin cabeceras */ }
+    return { status: r.status, server: srv, ok: r.ok && /#EXTM3U/.test(t), text: t };
+  })(), 4000, "KeKi m3u8");
 }
-// KeKi: la API ya da el HLS, pero el CDN puede exigir ciertas cabeceras. Se prueban varias y se usa la que responde.
-async function extractKeki(url, ctx) {
-  if (!/\.m3u8/i.test(url)) throw new Error("KeKi: la URL no es un HLS");
+function kekiNote(p) {
+  return "HTTP " + p.status + (p.server ? " [" + p.server + "]" : "") + (p.ok ? " m3u8 ok" : " " + p.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 28));
+}
+// Se hace una sola vez por busqueda (KeKi sale una vez por idioma): prueba cabeceras y devuelve las que funcionan
+async function kekiDiscover(url, ctx) {
   var pageRef = (ctx && ctx.referer) || PG_BASE + "/";
+  // la pagina llama a /api/vast/tag antes de abrir el m3u8 (publicidad previa); se imita por si activa el enlace
+  try {
+    var vr = await withTimeout(pgFetch(PG_BASE + "/api/vast/tag", { headers: pgHeaders(pageRef, { "Accept": "application/json", "x-session-id": PG_SID }) }), 5000, "vast");
+    var vt = await vr.text();
+    trace("KeKi vast/tag: HTTP " + vr.status + " " + vt.replace(/\s+/g, " ").slice(0, 40));
+  } catch (e) { trace("KeKi vast/tag: " + shortErr(e)); }
+  var browser = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "es-419,es;q=0.9", "Referer": PG_BASE + "/", "Origin": PG_BASE, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "cross-site" };
   var variants = [
     { n: "A ref+origin", h: { "Referer": PG_BASE + "/", "Origin": PG_BASE, "User-Agent": UA } },
     { n: "B ref pagina", h: { "Referer": pageRef, "User-Agent": UA } },
-    { n: "C solo UA", h: { "User-Agent": UA } }
+    { n: "C solo UA", h: { "User-Agent": UA } },
+    { n: "D tipo navegador", h: browser }
   ];
   var chosen = null;
   for (var i = 0; i < variants.length && !chosen; i++) {
     try {
       var p = await kekiProbe(url, variants[i].h);
-      trace("KeKi " + variants[i].n + ": HTTP " + p.status + (p.ok ? " m3u8 ok" : " " + p.text.slice(0, 30)));
+      trace("KeKi " + variants[i].n + ": " + kekiNote(p));
       if (p.ok) chosen = { v: variants[i], text: p.text };
     } catch (e) { trace("KeKi " + variants[i].n + ": " + shortErr(e)); }
   }
-  if (chosen) {
-    try {
-      var text = chosen.text;
-      if (text.indexOf("#EXTINF") === -1) {
-        var sub = text.split("\n").map(function (l) { return l.trim(); }).filter(function (l) { return l && l.charAt(0) !== "#"; })[0];
-        if (sub) {
-          var subUrl = new URL(sub, url).href;
-          var sp = await kekiProbe(subUrl, chosen.v.h);
-          trace("KeKi sublista: HTTP " + sp.status + (sp.ok ? " ok" : ""));
-          text = sp.text;
-        }
+  if (!chosen) { trace("KeKi: ninguna variante abre el m3u8"); return variants[0].h; }
+  try {
+    var text = chosen.text;
+    if (text.indexOf("#EXTINF") === -1) {
+      var sub = text.split("\n").map(function (l) { return l.trim(); }).filter(function (l) { return l && l.charAt(0) !== "#"; })[0];
+      if (sub) {
+        var sp = await kekiProbe(new URL(sub, url).href, chosen.v.h);
+        trace("KeKi sublista: " + kekiNote(sp));
+        text = sp.text;
       }
-      var km = /URI="([^"]+)"/.exec(text);
-      if (km) {
-        var kr = await pgFetch(new URL(km[1], url).href, { headers: chosen.v.h });
-        var kb = await kr.arrayBuffer();
-        trace("KeKi clave: HTTP " + kr.status + ", " + kb.byteLength + " bytes");
-      } else {
-        trace("KeKi sin clave (sin cifrado)");
-      }
-    } catch (e) { trace("KeKi sondeo: " + shortErr(e)); }
-  } else {
-    trace("KeKi: ninguna variante abre el m3u8");
-  }
-  return { url: url, type: "hls", headers: (chosen ? chosen.v.h : variants[0].h) };
+    }
+    var km = /URI="([^"]+)"/.exec(text);
+    if (km) {
+      var kr = await withTimeout(pgFetch(new URL(km[1], url).href, { headers: chosen.v.h }), 4000, "clave");
+      var kb = await withTimeout(kr.arrayBuffer(), 4000, "clave");
+      trace("KeKi clave: HTTP " + kr.status + ", " + kb.byteLength + " bytes");
+    } else {
+      trace("KeKi sin clave (sin cifrado)");
+    }
+  } catch (e) { trace("KeKi sondeo: " + shortErr(e)); }
+  return chosen.v.h;
+}
+async function extractKeki(url, ctx) {
+  if (!/\.m3u8/i.test(url)) throw new Error("KeKi: la URL no es un HLS");
+  if (!kekiState.p) kekiState.p = kekiDiscover(url, ctx);
+  var headers = await kekiState.p;
+  return { url: url, type: "hls", headers: headers };
 }
 
 var EXTRACTORS = {
@@ -381,6 +398,8 @@ function langInfo(l) {
 async function getStreamsInner(tmdbId, type, season, episode) {
   TRACE = [];
   TMDB_YEAR = null;
+  PG_SID = "";
+  kekiState = { p: null };
   trace("PelisGO v" + VERSION);
   if (!tmdbId || type !== "tv") {
     trace("solo soporta series (tipo recibido: " + type + ", id: " + tmdbId + ")");
@@ -413,7 +432,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       if (!key) return null;
       var source = EXTRACTORS[key];
       try {
-        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 25000, source.label);
+        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 35000, source.label);
         var list = Array.isArray(resolved) ? resolved : [resolved];
         if (list.length > 1) {
           var mp4s = list.filter(function (v) { return v.type !== "hls"; });
