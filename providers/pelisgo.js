@@ -28,7 +28,7 @@ var ENABLED_SOURCES = {
   Voe: true,       // puede dar 403 desde Render
   Okru: true
 };
-var VERSION = "1.0.2";
+var VERSION = "1.0.3";
 var PREFER_FORMAT = "mp4"; // un solo stream por servidor: "mp4" (archivo directo) o "hls"
 var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
@@ -379,10 +379,13 @@ function langInfo(l) {
 
 // ---------- punto de entrada ----------
 async function getStreamsInner(tmdbId, type, season, episode) {
-  if (!tmdbId || type !== "tv") return [];
   TRACE = [];
   TMDB_YEAR = null;
   trace("PelisGO v" + VERSION);
+  if (!tmdbId || type !== "tv") {
+    trace("solo soporta series (tipo recibido: " + type + ", id: " + tmdbId + ")");
+    return diagnostic();
+  }
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
@@ -427,4 +430,51 @@ async function getStreamsInner(tmdbId, type, season, episode) {
               "\n\uD83D\uDD17 T" + seasonNum + "E" + episodeNum + " \u00B7 " + ep.url,
             headers: v.headers,
             _lang: li.order,
-            _rank: SERVER
+            _rank: SERVER_ORDER.indexOf(key)
+          };
+          if (v.type) o.type = v.type;
+          return o;
+        });
+      } catch (e) {
+        trace(source.label + " fallo: " + shortErr(e));
+        console.warn("[" + source.label + "] fallo: " + e.message);
+        return null;
+      }
+    });
+    var results = [];
+    (await Promise.all(jobs)).filter(Boolean).forEach(function (arr) { results = results.concat(arr); });
+    results.sort(function (a, b) { return a._lang !== b._lang ? a._lang - b._lang : a._rank - b._rank; });
+    results.forEach(function (r) { delete r._lang; delete r._rank; });
+    console.log("[PelisGO] " + results.length + " streams");
+    if (results.length === 0) return diagnostic();
+    if (DEBUG) results = results.concat(diagnostic());
+    return results;
+  } catch (e) {
+    trace("error: " + shortErr(e));
+    console.error("[PelisGO] Error: " + e.message);
+    return diagnostic();
+  }
+}
+
+// Entrada informativa (no reproducible) para ver en la lista de Nuvio por que no salio nada
+function diagnostic() {
+  if (!DEBUG) return [];
+  return [{
+    name: "PelisGO",
+    title: "",
+    url: PG_BASE + "/",
+    quality: "\uD83D\uDEE0 DIAGNOSTICO (no reproducir)\n" + TRACE.join("\n"),
+    headers: {}
+  }];
+}
+
+async function getStreams(tmdbId, type, season, episode) {
+  try {
+    return await withTimeout(getStreamsInner(tmdbId, type, season, episode), 45000, "PelisGO");
+  } catch (e) {
+    trace("global: " + shortErr(e));
+    return diagnostic();
+  }
+}
+
+exports.getStreams = getStreams;
