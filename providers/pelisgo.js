@@ -4,10 +4,9 @@
  *        -> pagina /series/<slug>/temporada/<T>/episodio/<E> -> episodeId (datos de Next.js)
  *        -> POST /api/session/sync -> sid
  *        -> GET /api/series/episode/<episodeId>/stream con cabecera x-session-id -> links[]
- *        -> KeKi (HLS directo) | Magi (Filemoon) | Voe | Okru
+ *        -> Voe | Okru (cada uno con sus opciones HLS y MP4)
  * Voe suele fallar dentro del addon de Render (403), pero fuera del addon funciona.
  */
-var CryptoJS = require("crypto-js");
 var PG_BASE = "https://pelisgo.online";
 var AJ_BASE = PG_BASE; // los extractores copiados usan AJ_BASE como Referer por defecto
 var TMDB_API_KEY = "56db0ec297530920213e1503706b81ff";
@@ -23,18 +22,15 @@ function withTimeout(promise, ms, label) {
 function pgFetch(url, opts) { return withTimeout(_nativeFetch(url, opts), 10000, String(url).replace(/^https?:\/\//, "").split("/")[0]); }
 
 var ENABLED_SOURCES = {
-  Keki: true,      // HLS directo que entrega la API del sitio
-  Filemoon: true,  // "Magi" en la web
-  Voe: true,       // puede dar 403 desde Render
-  Okru: true
+  Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
+  Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.0.4";
-var PREFER_FORMAT = "mp4"; // un solo stream por servidor: "mp4" (archivo directo) o "hls"
+var VERSION = "1.1.0";
 var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
-var SERVER_ORDER = ["Keki", "Filemoon", "Okru", "Voe"];
+var SERVER_ORDER = ["Okru", "Voe"];
 
 // ---------- utilidades ----------
 function norm(s) {
@@ -160,45 +156,6 @@ async function extractOkru(embedUrl, ctx) {
 
 
 
-function b64uWords(t) {
-  var b = String(t || "").replace(/-/g, "+").replace(/_/g, "/");
-  while (b.length % 4) b += "=";
-  return CryptoJS.enc.Base64.parse(b);
-}
-async function getJson(url, headers) {
-  var r = await pgFetch(url, { headers: Object.assign({ "User-Agent": UA }, headers || {}) });
-  if (!r.ok) throw new Error("HTTP " + r.status + " en " + hostOf(url));
-  return r.json();
-}
-function embedId(u) {
-  var clean = String(u).replace(/[?#].*$/, "");
-  var m = /\/(?:e|d|v|embed)\/([A-Za-z0-9_-]+)/.exec(clean);
-  return m ? m[1] : clean.replace(/\/+$/, "").split("/").pop();
-}
-async function extractFilemoon(embedUrl, ctx) {
-  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
-  var base = ajOrigin(embedUrl);
-  var code = embedId(embedUrl);
-  var det = await getJson(base + "/api/videos/" + code + "/embed/details", { "Referer": embedUrl, "X-Requested-With": "XMLHttpRequest" });
-  var frame = det && det.embed_frame_url;
-  if (!frame) throw new Error("Filemoon: sin embed_frame_url");
-  var fbase = ajOrigin(frame);
-  var fcode = embedId(frame);
-  var play = await getJson(fbase + "/api/videos/" + fcode + "/embed/playback", { "Accept": "*/*", "Referer": frame, "X-Embed-Parent": embedUrl, "Accept-Language": "en-US,en;q=0.5" });
-  var p = play && play.playback;
-  if (!p || !p.key_parts || !p.payload || !p.iv) throw new Error("Filemoon: playback sin datos");
-  var key = b64uWords(p.key_parts[0]).concat(b64uWords(p.key_parts[1]));
-  var clear = CryptoJS.AES.decrypt({ ciphertext: b64uWords(p.payload) }, key, { iv: b64uWords(p.iv), mode: CryptoJS.mode.GCM, padding: CryptoJS.pad.NoPadding }).toString(CryptoJS.enc.Utf8);
-  var data = JSON.parse(clear.replace(/^\uFEFF/, ""));
-  var src = data.sources && data.sources[0];
-  if (!src || !src.url) throw new Error("Filemoon: sin fuente");
-  var o = { url: src.url, headers: { "Referer": base + "/", "User-Agent": UA } };
-  if (/\.m3u8/.test(src.url)) o.type = "hls";
-  return o;
-}
-
-
-
 // ---------- PelisGO ----------
 function pgHeaders(referer, extra) {
   var h = {
@@ -298,91 +255,19 @@ async function getLinks(episodeId, pageUrl) {
   return data.links || [];
 }
 
-var kekiState = { p: null };
-async function kekiProbe(url, headers) {
-  return withTimeout((async function () {
-    var r = await pgFetch(url, { headers: headers });
-    var t = await r.text();
-    var srv = "";
-    try { srv = (r.headers && r.headers.get && (r.headers.get("server") || r.headers.get("x-served-by"))) || ""; } catch (e) { /* sin cabeceras */ }
-    return { status: r.status, server: srv, ok: r.ok && /#EXTM3U/.test(t), text: t };
-  })(), 4000, "KeKi m3u8");
-}
-function kekiNote(p) {
-  return "HTTP " + p.status + (p.server ? " [" + p.server + "]" : "") + (p.ok ? " m3u8 ok" : " " + p.text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 28));
-}
-// Se hace una sola vez por busqueda (KeKi sale una vez por idioma): prueba cabeceras y devuelve las que funcionan
-async function kekiDiscover(url, ctx) {
-  var pageRef = (ctx && ctx.referer) || PG_BASE + "/";
-  // la pagina llama a /api/vast/tag antes de abrir el m3u8 (publicidad previa); se imita por si activa el enlace
-  try {
-    var vr = await withTimeout(pgFetch(PG_BASE + "/api/vast/tag", { headers: pgHeaders(pageRef, { "Accept": "application/json", "x-session-id": PG_SID }) }), 5000, "vast");
-    var vt = await vr.text();
-    trace("KeKi vast/tag: HTTP " + vr.status + " " + vt.replace(/\s+/g, " ").slice(0, 40));
-  } catch (e) { trace("KeKi vast/tag: " + shortErr(e)); }
-  var browser = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "es-419,es;q=0.9", "Referer": PG_BASE + "/", "Origin": PG_BASE, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "cross-site" };
-  var variants = [
-    { n: "A ref+origin", h: { "Referer": PG_BASE + "/", "Origin": PG_BASE, "User-Agent": UA } },
-    { n: "B ref pagina", h: { "Referer": pageRef, "User-Agent": UA } },
-    { n: "C solo UA", h: { "User-Agent": UA } },
-    { n: "D tipo navegador", h: browser }
-  ];
-  var chosen = null;
-  for (var i = 0; i < variants.length && !chosen; i++) {
-    try {
-      var p = await kekiProbe(url, variants[i].h);
-      trace("KeKi " + variants[i].n + ": " + kekiNote(p));
-      if (p.ok) chosen = { v: variants[i], text: p.text };
-    } catch (e) { trace("KeKi " + variants[i].n + ": " + shortErr(e)); }
-  }
-  if (!chosen) { trace("KeKi: ninguna variante abre el m3u8"); return variants[0].h; }
-  try {
-    var text = chosen.text;
-    if (text.indexOf("#EXTINF") === -1) {
-      var sub = text.split("\n").map(function (l) { return l.trim(); }).filter(function (l) { return l && l.charAt(0) !== "#"; })[0];
-      if (sub) {
-        var sp = await kekiProbe(new URL(sub, url).href, chosen.v.h);
-        trace("KeKi sublista: " + kekiNote(sp));
-        text = sp.text;
-      }
-    }
-    var km = /URI="([^"]+)"/.exec(text);
-    if (km) {
-      var kr = await withTimeout(pgFetch(new URL(km[1], url).href, { headers: chosen.v.h }), 4000, "clave");
-      var kb = await withTimeout(kr.arrayBuffer(), 4000, "clave");
-      trace("KeKi clave: HTTP " + kr.status + ", " + kb.byteLength + " bytes");
-    } else {
-      trace("KeKi sin clave (sin cifrado)");
-    }
-  } catch (e) { trace("KeKi sondeo: " + shortErr(e)); }
-  return chosen.v.h;
-}
-async function extractKeki(url, ctx) {
-  if (!/\.m3u8/i.test(url)) throw new Error("KeKi: la URL no es un HLS");
-  if (!kekiState.p) kekiState.p = kekiDiscover(url, ctx);
-  var headers = await kekiState.p;
-  return { url: url, type: "hls", headers: headers };
-}
-
 var EXTRACTORS = {
-  Keki: { label: "KeKi", extract: extractKeki },
-  Filemoon: { label: "Magi (Filemoon)", extract: extractFilemoon },
   Voe: { label: "VOE", extract: extractVoe },
   Okru: { label: "Okru", extract: extractOkru }
 };
 function findSourceKey(serverName, serverUrl) {
   var n = norm(serverName).replace(/[^a-z0-9]/g, "");
   var key = null;
-  if (n.indexOf("keki") !== -1) key = "Keki";
-  else if (n.indexOf("magi") !== -1 || n.indexOf("filemoon") !== -1) key = "Filemoon";
-  else if (n.indexOf("voe") !== -1) key = "Voe";
+  if (n.indexOf("voe") !== -1) key = "Voe";
   else if (n.indexOf("okru") !== -1) key = "Okru";
   if (!key && serverUrl) {
     var h = hostOf(serverUrl).toLowerCase();
-    if (/filemoon|byse|moonplayer/.test(h)) key = "Filemoon";
-    else if (/voe/.test(h)) key = "Voe";
+    if (/voe/.test(h)) key = "Voe";
     else if (/ok\.ru/.test(h)) key = "Okru";
-    else if (/cdn-tnmr/.test(h)) key = "Keki";
   }
   return key && ENABLED_SOURCES[key] ? key : null;
 }
@@ -399,7 +284,6 @@ async function getStreamsInner(tmdbId, type, season, episode) {
   TRACE = [];
   TMDB_YEAR = null;
   PG_SID = "";
-  kekiState = { p: null };
   trace("PelisGO v" + VERSION);
   if (!tmdbId || type !== "tv") {
     trace("solo soporta series (tipo recibido: " + type + ", id: " + tmdbId + ")");
@@ -434,11 +318,6 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       try {
         var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 35000, source.label);
         var list = Array.isArray(resolved) ? resolved : [resolved];
-        if (list.length > 1) {
-          var mp4s = list.filter(function (v) { return v.type !== "hls"; });
-          var hlss = list.filter(function (v) { return v.type === "hls"; });
-          list = [PREFER_FORMAT === "hls" ? (hlss[0] || mp4s[0]) : (mp4s[0] || hlss[0])];
-        }
         var li = langInfo(lk.language);
         return list.map(function (v) {
           var o = {
@@ -466,7 +345,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
     results.forEach(function (r) { delete r._lang; delete r._rank; });
     console.log("[PelisGO] " + results.length + " streams");
     if (results.length === 0) return diagnostic();
-    if (DEBUG) results = results.concat(diagnostic());
+    if (DEBUG && TRACE.some(function (t) { return /fallo/.test(t); })) results = results.concat(diagnostic());
     return results;
   } catch (e) {
     trace("error: " + shortErr(e));
