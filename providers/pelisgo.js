@@ -26,12 +26,15 @@ var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.2.0";
+var VERSION = "1.2.1";
+var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
+var T0 = 0;
+function lap(label) { trace(label + " +" + (Date.now() - T0) + "ms"); }
 var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
-var SERVER_ORDER = ["Okru", "Voe"];
+var SERVER_ORDER = ["Voe", "Okru"]; // orden en la lista: Voe primero
 
 // ---------- utilidades ----------
 function norm(s) {
@@ -179,19 +182,30 @@ async function pgJson(url, opts) {
 
 var TMDB_YEAR = null;
 var PG_SID = "";
+var PG_SYNC = null;
+function startSync() {
+  PG_SYNC = pgJson(PG_BASE + "/api/session/sync", {
+    method: "POST",
+    headers: pgHeaders(PG_BASE + "/", { "Content-Type": "application/json", "Accept": "application/json", "Origin": PG_BASE }),
+    body: "{}"
+  });
+  PG_SYNC.catch(function () { /* se reintenta en getLinks */ });
+}
 async function getTMDBTitles(tmdbId, kind) {
   var base = "https://api.themoviedb.org/3/" + (kind === "movie" ? "movie" : "tv") + "/" + tmdbId + "?api_key=" + TMDB_API_KEY;
   var langs = ["es-MX", "en-US"];
+  var all = await Promise.all(langs.map(function (l) {
+    return pgFetch(base + "&language=" + l, { headers: { "User-Agent": UA } })
+      .then(function (r) { return r.json(); })
+      .catch(function () { return null; });
+  }));
   var titles = [];
-  for (var i = 0; i < langs.length; i++) {
-    try {
-      var d = await pgFetch(base + "&language=" + langs[i], { headers: { "User-Agent": UA } }).then(function (r) { return r.json(); });
-      if (!d || d.success === false) continue;
-      var date = kind === "movie" ? d.release_date : d.first_air_date;
-      if (date && !TMDB_YEAR) TMDB_YEAR = parseInt(String(date).slice(0, 4), 10);
-      (kind === "movie" ? [d.title, d.original_title] : [d.name, d.original_name]).forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
-    } catch (e) { /* siguiente idioma */ }
-  }
+  all.forEach(function (d) {
+    if (!d || d.success === false) return;
+    var date = kind === "movie" ? d.release_date : d.first_air_date;
+    if (date && !TMDB_YEAR) TMDB_YEAR = parseInt(String(date).slice(0, 4), 10);
+    (kind === "movie" ? [d.title, d.original_title] : [d.name, d.original_name]).forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
+  });
   return titles;
 }
 
@@ -252,11 +266,15 @@ async function getMovieId(slug, searchId) {
 }
 
 async function getLinks(contentId, pageUrl, isMovie) {
-  var sync = await pgJson(PG_BASE + "/api/session/sync", {
-    method: "POST",
-    headers: pgHeaders(pageUrl, { "Content-Type": "application/json", "Accept": "application/json", "Origin": PG_BASE }),
-    body: "{}"
-  });
+  var sync = null;
+  try { if (PG_SYNC) sync = await PG_SYNC; } catch (e) { trace("session/sync previo: " + shortErr(e)); }
+  if (!sync || !sync.sid) {
+    sync = await pgJson(PG_BASE + "/api/session/sync", {
+      method: "POST",
+      headers: pgHeaders(pageUrl, { "Content-Type": "application/json", "Accept": "application/json", "Origin": PG_BASE }),
+      body: "{}"
+    });
+  }
   if (!sync.sid) throw new Error("session/sync sin sid");
   PG_SID = sync.sid;
   var api = PG_BASE + (isMovie ? "/api/movies/" + contentId + "/stream" : "/api/series/episode/" + contentId + "/stream");
@@ -299,12 +317,15 @@ async function getStreamsInner(tmdbId, type, season, episode) {
   TRACE = [];
   TMDB_YEAR = null;
   PG_SID = "";
+  PG_SYNC = null;
+  T0 = Date.now();
   trace("PelisGO v" + VERSION);
   var isMovie = type === "movie";
   if (!tmdbId || (type !== "tv" && !isMovie)) {
     trace("solo soporta series y peliculas (tipo recibido: " + type + ", id: " + tmdbId + ")");
     return diagnostic();
   }
+  startSync();
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
@@ -321,19 +342,30 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       if (!found) { trace((isMovie ? "pelicula" : "serie") + " no encontrada en PelisGO"); return diagnostic(); }
       slug = found.slug;
       searchId = found.id;
+      lap("titulo+busqueda");
       trace((isMovie ? "pelicula: " : "serie: ") + slug + " (puntos " + found.score.toFixed(1) + ")");
     }
-    var ep = isMovie ? await getMovieId(slug, searchId) : await getEpisodeId(slug, seasonNum, episodeNum);
-    trace((isMovie ? "movieId " : "episodeId ") + ep.id);
-    var links = await getLinks(ep.id, ep.url, isMovie);
+    var ep, links = null;
+    if (isMovie && searchId) {
+      try {
+        var fast = await getLinks(searchId, PG_BASE + "/movies/" + slug, true);
+        if (fast.length) { ep = { id: searchId, url: PG_BASE + "/movies/" + slug }; links = fast; trace("pelicula: id de la busqueda"); }
+      } catch (e) { trace("id de la busqueda no sirvio: " + shortErr(e)); }
+    }
+    if (!links) {
+      ep = isMovie ? await getMovieId(slug, searchId) : await getEpisodeId(slug, seasonNum, episodeNum);
+      trace((isMovie ? "movieId " : "episodeId ") + ep.id);
+      links = await getLinks(ep.id, ep.url, isMovie);
+    }
     trace("servidores: " + links.map(function (l) { return l.server; }).join(","));
+    lap("enlaces");
 
     var jobs = links.map(async function (lk) {
       var key = findSourceKey(lk.server, lk.url);
       if (!key) return null;
       var source = EXTRACTORS[key];
       try {
-        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 35000, source.label);
+        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 15000, source.label);
         var list = Array.isArray(resolved) ? resolved : [resolved];
         var li = langInfo(lk.language);
         return list.map(function (v) {
@@ -359,10 +391,14 @@ async function getStreamsInner(tmdbId, type, season, episode) {
     var results = [];
     (await Promise.all(jobs)).filter(Boolean).forEach(function (arr) { results = results.concat(arr); });
     results.sort(function (a, b) { return a._lang !== b._lang ? a._lang - b._lang : a._rank - b._rank; });
-    results.forEach(function (r) { delete r._lang; delete r._rank; });
+    lap("extractores");
+    results.forEach(function (r, i) {
+      delete r._lang; delete r._rank;
+      r.quality = (i + 1 < 10 ? "0" : "") + (i + 1) + " \u00B7 " + r.quality; // la app reordena por texto: el numero fija el orden
+    });
     console.log("[PelisGO] " + results.length + " streams");
     if (results.length === 0) return diagnostic();
-    if (DEBUG && TRACE.some(function (t) { return /fallo/.test(t); })) results = results.concat(diagnostic());
+    if (DEBUG && (TIMING || TRACE.some(function (t) { return /fallo/.test(t); }))) results = results.concat(diagnostic());
     return results;
   } catch (e) {
     trace("error: " + shortErr(e));
