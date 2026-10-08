@@ -26,7 +26,9 @@ var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.3.1";
+var VERSION = "1.3.3";
+var PROBE_QUALITY = true; // false = no leer la lista HLS para medir la calidad (mas rapido; usa solo el nombre de calidad de Okru)
+var PROBE_MS = 0;
 var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
 var T0 = 0;
 function lap(label) { trace(label + " +" + (Date.now() - T0) + "ms"); }
@@ -187,6 +189,7 @@ async function probeHls(url, headers) {
 }
 async function describeQuality(v) {
   if (v.type === "hls") {
+    if (!PROBE_QUALITY) return null;
     var r = await probeHls(v.url, v.headers);
     return r ? { label: qualityFromSize(r.w, r.h), size: r.w + "\u00D7" + r.h, exact: true } : null;
   }
@@ -195,7 +198,9 @@ async function describeQuality(v) {
   return null;
 }
 async function qualitiesFor(list) {
+  var tq = Date.now();
   var qs = await Promise.all(list.map(function (v) { return describeQuality(v).catch(function () { return null; }); }));
+  PROBE_MS = Math.max(PROBE_MS, Date.now() - tq);
   var ref = qs.filter(function (q) { return q && q.exact; })[0] || qs.filter(Boolean)[0];
   return qs.map(function (q) { return q || (ref ? { label: ref.label, size: ref.size, approx: true } : null); });
 }
@@ -271,7 +276,7 @@ async function findSlug(titles, kind, onlyQuery) {
     for (var q = 0; q < queries.length; q++) {
       var data;
       try {
-        data = await pgJson(PG_BASE + "/api/search?q=" + encodeURIComponent(queries[q]), { headers: pgHeaders(PG_BASE + "/", { "Accept": "application/json" }) });
+        data = await hedged(function () { return pgJson(PG_BASE + "/api/search?q=" + encodeURIComponent(queries[q]), { headers: pgHeaders(PG_BASE + "/", { "Accept": "application/json" }) }); }, 2200);
       } catch (e) { trace("busqueda '" + queries[q] + "': " + shortErr(e)); continue; }
       var res = (data.results || []).filter(function (r) { return r.type === (kind === "movie" ? "movie" : "serie"); });
       trace("busqueda '" + queries[q] + "': " + res.length + (kind === "movie" ? " peliculas" : " series"));
@@ -294,6 +299,52 @@ async function getEpisodeId(slug, season, episode) {
   var m = /episodeId\\?":\\?"([a-z0-9]{15,})/.exec(html) || /episodeId=([a-z0-9]{15,})/.exec(html);
   if (!m) { trace("sin episodeId: " + describeHtml(html)); throw new Error("no se encontro episodeId"); }
   return { id: m[1], url: url };
+}
+
+// Si la primera peticion tarda mas de "delay" ms, lanza una segunda igual y usa la que responda antes
+function hedged(makeReq, delay) {
+  return new Promise(function (resolve, reject) {
+    var done = false, fails = 0, total = 1;
+    function go() {
+      makeReq().then(function (v) { if (!done) { done = true; resolve(v); } },
+        function (e) { fails++; if (!done && fails >= total) { done = true; reject(e); } });
+    }
+    go();
+    setTimeout(function () { if (!done) { total = 2; go(); } }, delay);
+  });
+}
+// Si la pagina muestra un anio, debe coincidir (±1) con el de TMDB; si no lo muestra, se acepta
+function pageYearOk(html) {
+  var m = /\\?"(?:year|releaseYear|release_year|releaseDate|release_date)\\?":\\?"?(\d{4})/.exec(html);
+  return !m || !TMDB_YEAR || Math.abs(parseInt(m[1], 10) - TMDB_YEAR) <= 1;
+}
+async function guessMovie(slug, titles) {
+  try {
+    var url = PG_BASE + "/movies/" + slug;
+    var resp = await pgFetch(url, { headers: pgHeaders(PG_BASE + "/") });
+    if (!resp.ok) return null;
+    var html = await resp.text();
+    var m = /movieId\\?":\\?"([a-z0-9]{15,})\\?",\\?"title\\?":\\?"([^"\\]+)/.exec(html);
+    if (!m) return null;
+    var same = titles.some(function (t) { return scoreTitle(t, m[2]) >= 2.5; });
+    return same && pageYearOk(html) ? { id: m[1], url: url, slug: slug } : null;
+  } catch (e) { return null; }
+}
+
+// Adelanto: abre la pagina del episodio con el slug que sale del titulo de TMDB, a la vez que corre la busqueda.
+// Solo se acepta si el titulo de la serie en esa pagina coincide exactamente con alguno de TMDB.
+async function guessEpisode(slug, season, episode, titles) {
+  try {
+    var url = PG_BASE + "/series/" + slug + "/temporada/" + season + "/episodio/" + episode;
+    var resp = await pgFetch(url, { headers: pgHeaders(PG_BASE + "/series/" + slug) });
+    if (!resp.ok) return null;
+    var html = await resp.text();
+    var sm = /serieTitle\\?":\\?"([^"\\]+)/.exec(html);
+    var m = /episodeId\\?":\\?"([a-z0-9]{15,})/.exec(html);
+    if (!sm || !m) return null;
+    var same = titles.some(function (t) { return scoreTitle(t, sm[1]) >= 2.5; });
+    return same && pageYearOk(html) ? { id: m[1], url: url, slug: slug } : null;
+  } catch (e) { return null; }
 }
 
 async function getMovieId(slug, searchId) {
@@ -362,6 +413,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
   TMDB_YEAR = null;
   PG_SID = "";
   PG_SYNC = null;
+  PROBE_MS = 0;
   T0 = Date.now();
   trace("PelisGO v" + VERSION);
   var isMovie = type === "movie";
@@ -373,7 +425,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
-    var slug, searchId = null;
+    var slug, searchId = null, specEp = null, spec = null, specSlug = "";
     var ckey = (isMovie ? "m" : "t") + tmdbId;
     var direct = /^slug:([a-z0-9][a-z0-9\-]*)$/i.exec(String(tmdbId));
     if (direct) {
@@ -389,31 +441,65 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       if (!titles.length) { trace("TMDB sin titulos"); return diagnostic(); }
       trace("TMDB: " + titles.slice(0, 2).join(" / ") + " (" + TMDB_YEAR + ")" + (isMovie ? " pelicula" : " T" + seasonNum + "E" + episodeNum));
       lap("tmdb");
-      var found = await findSlug(titles, isMovie ? "movie" : "tv");
-      if (!found) {
-        var more = (await tm.second).filter(function (t) { return titles.indexOf(t) === -1; });
-        if (more.length) {
-          trace("reintento con titulos de en-US");
-          titles = titles.concat(more);
-          found = await findSlug(titles, isMovie ? "movie" : "tv", more);
+      specSlug = slugify(titles[0]);
+      if (specSlug) spec = isMovie ? guessMovie(specSlug, titles) : guessEpisode(specSlug, seasonNum, episodeNum, titles);
+      var searchP = (async function () {
+        var f = await findSlug(titles, isMovie ? "movie" : "tv");
+        if (!f) {
+          var more = (await tm.second).filter(function (t) { return titles.indexOf(t) === -1; });
+          if (more.length) {
+            trace("reintento con titulos de en-US");
+            titles = titles.concat(more);
+            f = await findSlug(titles, isMovie ? "movie" : "tv", more);
+          }
         }
+        return f;
+      })();
+      searchP.catch(function () { /* se maneja al esperar */ });
+      var found = null;
+      if (spec) {
+        var first = await Promise.race([
+          searchP.then(function (f) { return { f: f }; }),
+          spec.then(function (sp) { return sp ? { sp: sp } : new Promise(function () { /* adivinanza invalida: gana la busqueda */ }); })
+        ]);
+        if (first.sp) {
+          specEp = first.sp;
+          found = { slug: specEp.slug, id: null, score: 9.9 };
+          trace("pagina adivinada antes que la busqueda: " + specEp.slug);
+        } else {
+          found = first.f;
+        }
+      } else {
+        found = await searchP;
+      }
+      if (!found && spec) {
+        var sp = await spec;
+        if (sp) { specEp = sp; found = { slug: sp.slug, id: null, score: 9.9 }; trace("serie adivinada por titulo: " + sp.slug); }
       }
       if (!found) { trace((isMovie ? "pelicula" : "serie") + " no encontrada en PelisGO"); return diagnostic(); }
       slug = found.slug;
+      if (spec && !specEp && slug === specSlug) { specEp = await spec; if (specEp) trace("episodio adelantado"); }
       searchId = found.id;
-      PG_CACHE[ckey] = { slug: slug, id: searchId };
+      PG_CACHE[ckey] = { slug: slug, id: searchId || (isMovie && specEp ? specEp.id : null) };
       lap("titulo+busqueda");
       trace((isMovie ? "pelicula: " : "serie: ") + slug + " (puntos " + found.score.toFixed(1) + ")");
     }
     var ep, links = null;
-    if (isMovie && searchId) {
+    if (isMovie && specEp) {
+      try {
+        links = await getLinks(specEp.id, specEp.url, true);
+        ep = specEp;
+        if (!links.length) links = null;
+      } catch (e) { links = null; trace("pagina adivinada no sirvio: " + shortErr(e)); }
+    }
+    if (!links && isMovie && searchId) {
       try {
         var fast = await getLinks(searchId, PG_BASE + "/movies/" + slug, true);
         if (fast.length) { ep = { id: searchId, url: PG_BASE + "/movies/" + slug }; links = fast; trace("pelicula: id de la busqueda"); }
       } catch (e) { trace("id de la busqueda no sirvio: " + shortErr(e)); }
     }
     if (!links) {
-      ep = isMovie ? await getMovieId(slug, searchId) : await getEpisodeId(slug, seasonNum, episodeNum);
+      ep = isMovie ? await getMovieId(slug, searchId) : (specEp || await getEpisodeId(slug, seasonNum, episodeNum));
       trace((isMovie ? "movieId " : "episodeId ") + ep.id);
       links = await getLinks(ep.id, ep.url, isMovie);
     }
@@ -454,7 +540,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
     var results = [];
     (await Promise.all(jobs)).filter(Boolean).forEach(function (arr) { results = results.concat(arr); });
     results.sort(function (a, b) { return a._lang !== b._lang ? a._lang - b._lang : a._rank - b._rank; });
-    lap("extractores");
+    lap("extractores (calidad max " + PROBE_MS + "ms)");
     results.forEach(function (r, i) {
       delete r._lang; delete r._rank;
       r.quality = (i + 1 < 10 ? "0" : "") + (i + 1) + " \u00B7 " + r.quality; // la app reordena por texto: el numero fija el orden
