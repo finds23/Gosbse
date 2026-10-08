@@ -26,7 +26,7 @@ var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.2.1";
+var VERSION = "1.3.1";
 var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
 var T0 = 0;
 function lap(label) { trace(label + " +" + (Date.now() - T0) + "ms"); }
@@ -160,6 +160,46 @@ async function extractOkru(embedUrl, ctx) {
 
 
 
+// ---------- calidad real del video ----------
+var OK_HEIGHT = { mobile: 144, lowest: 240, low: 360, sd: 480, hd: 720, full: 1080, quad: 1440, ultra: 2160 };
+function qualityFromSize(w, h) {
+  w = w || 0; h = h || 0;
+  if (w >= 3400 || h >= 2000) return "4K";
+  if (w >= 2400 || h >= 1300) return "1440p";
+  if (w >= 1800 || h >= 1000) return "1080p";
+  if (w >= 1200 || h >= 700) return "720p";
+  if (w >= 800 || h >= 450) return "480p";
+  if (w >= 500 || h >= 330) return "360p";
+  return (h || w) + "p";
+}
+// Lee la lista maestra HLS y devuelve la resolucion mas alta que ofrece
+async function probeHls(url, headers) {
+  try {
+    var r = await withTimeout(pgFetch(url, { headers: headers || { "User-Agent": UA } }), 3000, "hls");
+    var t = await withTimeout(r.text(), 3000, "hls");
+    var best = null, re = /RESOLUTION=(\d+)x(\d+)/g, m;
+    while ((m = re.exec(t))) {
+      var w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+      if (!best || w * h > best.w * best.h) best = { w: w, h: h };
+    }
+    return best;
+  } catch (e) { return null; }
+}
+async function describeQuality(v) {
+  if (v.type === "hls") {
+    var r = await probeHls(v.url, v.headers);
+    return r ? { label: qualityFromSize(r.w, r.h), size: r.w + "\u00D7" + r.h, exact: true } : null;
+  }
+  var m = /MP4 (\w+)/.exec(v.tag || "");
+  if (m && OK_HEIGHT[m[1]]) return { label: qualityFromSize(0, OK_HEIGHT[m[1]]), exact: false };
+  return null;
+}
+async function qualitiesFor(list) {
+  var qs = await Promise.all(list.map(function (v) { return describeQuality(v).catch(function () { return null; }); }));
+  var ref = qs.filter(function (q) { return q && q.exact; })[0] || qs.filter(Boolean)[0];
+  return qs.map(function (q) { return q || (ref ? { label: ref.label, size: ref.size, approx: true } : null); });
+}
+
 // ---------- PelisGO ----------
 function pgHeaders(referer, extra) {
   var h = {
@@ -182,6 +222,7 @@ async function pgJson(url, opts) {
 
 var TMDB_YEAR = null;
 var PG_SID = "";
+var PG_CACHE = {};
 var PG_SYNC = null;
 function startSync() {
   PG_SYNC = pgJson(PG_BASE + "/api/session/sync", {
@@ -191,22 +232,24 @@ function startSync() {
   });
   PG_SYNC.catch(function () { /* se reintenta en getLinks */ });
 }
-async function getTMDBTitles(tmdbId, kind) {
+// Pide es-MX y en-US a la vez, pero la busqueda arranca en cuanto llega es-MX (en-US solo sirve de respaldo)
+function startTMDB(tmdbId, kind) {
   var base = "https://api.themoviedb.org/3/" + (kind === "movie" ? "movie" : "tv") + "/" + tmdbId + "?api_key=" + TMDB_API_KEY;
-  var langs = ["es-MX", "en-US"];
-  var all = await Promise.all(langs.map(function (l) {
+  function one(l) {
     return pgFetch(base + "&language=" + l, { headers: { "User-Agent": UA } })
       .then(function (r) { return r.json(); })
       .catch(function () { return null; });
-  }));
-  var titles = [];
-  all.forEach(function (d) {
-    if (!d || d.success === false) return;
+  }
+  function toTitles(d) {
+    var out = [];
+    if (!d || d.success === false) return out;
     var date = kind === "movie" ? d.release_date : d.first_air_date;
     if (date && !TMDB_YEAR) TMDB_YEAR = parseInt(String(date).slice(0, 4), 10);
-    (kind === "movie" ? [d.title, d.original_title] : [d.name, d.original_name]).forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
-  });
-  return titles;
+    (kind === "movie" ? [d.title, d.original_title] : [d.name, d.original_name]).forEach(function (t) { if (t && out.indexOf(t) === -1) out.push(t); });
+    return out;
+  }
+  var p1 = one("es-MX"), p2 = one("en-US");
+  return { first: p1.then(toTitles), second: p2.then(toTitles) };
 }
 
 function scoreTitle(a, b) {
@@ -218,12 +261,13 @@ function scoreTitle(a, b) {
   var common = tx.filter(function (t) { return t.length > 2 && ty.indexOf(t) !== -1; }).length;
   return common / Math.max(tx.length, ty.length);
 }
-async function findSlug(titles, kind) {
+async function findSlug(titles, kind, onlyQuery) {
   var best = null;
-  for (var i = 0; i < titles.length; i++) {
-    var queries = [titles[i]];
-    var short = titles[i].split(/[:\-\u2013]/)[0].trim();
-    if (short && short !== titles[i]) queries.push(short);
+  var qt = onlyQuery || titles;
+  for (var i = 0; i < qt.length; i++) {
+    var queries = [qt[i]];
+    var short = qt[i].split(/[:\-\u2013]/)[0].trim();
+    if (short && short !== qt[i]) queries.push(short);
     for (var q = 0; q < queries.length; q++) {
       var data;
       try {
@@ -330,18 +374,34 @@ async function getStreamsInner(tmdbId, type, season, episode) {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
     var slug, searchId = null;
+    var ckey = (isMovie ? "m" : "t") + tmdbId;
     var direct = /^slug:([a-z0-9][a-z0-9\-]*)$/i.exec(String(tmdbId));
     if (direct) {
       slug = direct[1].toLowerCase();
       trace("slug directo: " + slug);
+    } else if (PG_CACHE[ckey]) {
+      slug = PG_CACHE[ckey].slug; searchId = PG_CACHE[ckey].id;
+      trace("cache: " + slug);
     } else {
-      var titles = await getTMDBTitles(tmdbId, isMovie ? "movie" : "tv");
+      var tm = startTMDB(tmdbId, isMovie ? "movie" : "tv");
+      var titles = await tm.first;
+      if (!titles.length) titles = await tm.second;
       if (!titles.length) { trace("TMDB sin titulos"); return diagnostic(); }
       trace("TMDB: " + titles.slice(0, 2).join(" / ") + " (" + TMDB_YEAR + ")" + (isMovie ? " pelicula" : " T" + seasonNum + "E" + episodeNum));
+      lap("tmdb");
       var found = await findSlug(titles, isMovie ? "movie" : "tv");
+      if (!found) {
+        var more = (await tm.second).filter(function (t) { return titles.indexOf(t) === -1; });
+        if (more.length) {
+          trace("reintento con titulos de en-US");
+          titles = titles.concat(more);
+          found = await findSlug(titles, isMovie ? "movie" : "tv", more);
+        }
+      }
       if (!found) { trace((isMovie ? "pelicula" : "serie") + " no encontrada en PelisGO"); return diagnostic(); }
       slug = found.slug;
       searchId = found.id;
+      PG_CACHE[ckey] = { slug: slug, id: searchId };
       lap("titulo+busqueda");
       trace((isMovie ? "pelicula: " : "serie: ") + slug + " (puntos " + found.score.toFixed(1) + ")");
     }
@@ -368,12 +428,15 @@ async function getStreamsInner(tmdbId, type, season, episode) {
         var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 15000, source.label);
         var list = Array.isArray(resolved) ? resolved : [resolved];
         var li = langInfo(lk.language);
-        return list.map(function (v) {
+        var qs = await qualitiesFor(list);
+        return list.map(function (v, idx) {
+          var q = qs[idx];
+          var qshow = q ? ((q.approx ? "\u2248" : "") + q.label + (q.size ? " (" + q.size + ")" : "")) : ((lk.quality || "1080p") + " (web)");
           var o = {
             name: "PelisGO",
             title: "",
             url: v.url,
-            quality: "\uD83D\uDCFA " + source.label + (v.tag ? " (" + v.tag + ")" : "") + "\n" + (lk.quality || "1080p") + " | WEB-DL\n" + li.label +
+            quality: "\uD83D\uDCFA " + source.label + (v.tag ? " (" + v.tag + ")" : "") + "\n" + qshow + " | WEB-DL\n" + li.label +
               "\n\uD83D\uDD17 " + (isMovie ? "" : "T" + seasonNum + "E" + episodeNum + " \u00B7 ") + ep.url,
             headers: v.headers,
             _lang: li.order,
