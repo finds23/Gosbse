@@ -1,5 +1,6 @@
 /**
  * PelisGO (pelisgo.online) - plugin para Nuvio / addon Svdjksba
+ * Series y peliculas.
  * Flujo: TMDB -> titulo -> /api/search?q= -> slug de la serie
  *        -> pagina /series/<slug>/temporada/<T>/episodio/<E> -> episodeId (datos de Next.js)
  *        -> POST /api/session/sync -> sid
@@ -25,7 +26,7 @@ var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.1.0";
+var VERSION = "1.2.0";
 var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
@@ -178,16 +179,17 @@ async function pgJson(url, opts) {
 
 var TMDB_YEAR = null;
 var PG_SID = "";
-async function getTMDBTitles(tmdbId) {
-  var base = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + TMDB_API_KEY;
+async function getTMDBTitles(tmdbId, kind) {
+  var base = "https://api.themoviedb.org/3/" + (kind === "movie" ? "movie" : "tv") + "/" + tmdbId + "?api_key=" + TMDB_API_KEY;
   var langs = ["es-MX", "en-US"];
   var titles = [];
   for (var i = 0; i < langs.length; i++) {
     try {
       var d = await pgFetch(base + "&language=" + langs[i], { headers: { "User-Agent": UA } }).then(function (r) { return r.json(); });
       if (!d || d.success === false) continue;
-      if (d.first_air_date && !TMDB_YEAR) TMDB_YEAR = parseInt(String(d.first_air_date).slice(0, 4), 10);
-      [d.name, d.original_name].forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
+      var date = kind === "movie" ? d.release_date : d.first_air_date;
+      if (date && !TMDB_YEAR) TMDB_YEAR = parseInt(String(date).slice(0, 4), 10);
+      (kind === "movie" ? [d.title, d.original_title] : [d.name, d.original_name]).forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
     } catch (e) { /* siguiente idioma */ }
   }
   return titles;
@@ -202,7 +204,7 @@ function scoreTitle(a, b) {
   var common = tx.filter(function (t) { return t.length > 2 && ty.indexOf(t) !== -1; }).length;
   return common / Math.max(tx.length, ty.length);
 }
-async function findSeriesSlug(titles) {
+async function findSlug(titles, kind) {
   var best = null;
   for (var i = 0; i < titles.length; i++) {
     var queries = [titles[i]];
@@ -213,12 +215,12 @@ async function findSeriesSlug(titles) {
       try {
         data = await pgJson(PG_BASE + "/api/search?q=" + encodeURIComponent(queries[q]), { headers: pgHeaders(PG_BASE + "/", { "Accept": "application/json" }) });
       } catch (e) { trace("busqueda '" + queries[q] + "': " + shortErr(e)); continue; }
-      var res = (data.results || []).filter(function (r) { return r.type === "serie"; });
-      trace("busqueda '" + queries[q] + "': " + res.length + " series");
+      var res = (data.results || []).filter(function (r) { return r.type === (kind === "movie" ? "movie" : "serie"); });
+      trace("busqueda '" + queries[q] + "': " + res.length + (kind === "movie" ? " peliculas" : " series"));
       res.forEach(function (r) {
         var s = Math.max.apply(null, titles.map(function (t) { return scoreTitle(t, r.title); }));
         if (TMDB_YEAR && r.year && Math.abs(r.year - TMDB_YEAR) <= 1) s += 0.5;
-        if (!best || s > best.score) best = { slug: r.slug, title: r.title, score: s };
+        if (!best || s > best.score) best = { slug: r.slug, title: r.title, score: s, id: r.id };
       });
       if (best && best.score >= 2.5) return best;
     }
@@ -236,7 +238,20 @@ async function getEpisodeId(slug, season, episode) {
   return { id: m[1], url: url };
 }
 
-async function getLinks(episodeId, pageUrl) {
+async function getMovieId(slug, searchId) {
+  var url = PG_BASE + "/movies/" + slug;
+  try {
+    var resp = await pgFetch(url, { headers: pgHeaders(PG_BASE + "/") });
+    var html = await resp.text();
+    var m = /movieId\\?":\\?"([a-z0-9]{15,})/.exec(html) || /movieId=([a-z0-9]{15,})/.exec(html);
+    if (m) return { id: m[1], url: url };
+    trace("pagina pelicula sin movieId (HTTP " + resp.status + "): " + describeHtml(html));
+  } catch (e) { trace("pagina pelicula: " + shortErr(e)); }
+  if (searchId) { trace("usando el id de la busqueda"); return { id: searchId, url: url }; }
+  throw new Error("no se encontro movieId");
+}
+
+async function getLinks(contentId, pageUrl, isMovie) {
   var sync = await pgJson(PG_BASE + "/api/session/sync", {
     method: "POST",
     headers: pgHeaders(pageUrl, { "Content-Type": "application/json", "Accept": "application/json", "Origin": PG_BASE }),
@@ -244,7 +259,7 @@ async function getLinks(episodeId, pageUrl) {
   });
   if (!sync.sid) throw new Error("session/sync sin sid");
   PG_SID = sync.sid;
-  var api = PG_BASE + "/api/series/episode/" + episodeId + "/stream";
+  var api = PG_BASE + (isMovie ? "/api/movies/" + contentId + "/stream" : "/api/series/episode/" + contentId + "/stream");
   var data;
   try {
     data = await pgJson(api, { headers: pgHeaders(pageUrl, { "Accept": "application/json", "x-session-id": sync.sid }) });
@@ -285,30 +300,32 @@ async function getStreamsInner(tmdbId, type, season, episode) {
   TMDB_YEAR = null;
   PG_SID = "";
   trace("PelisGO v" + VERSION);
-  if (!tmdbId || type !== "tv") {
-    trace("solo soporta series (tipo recibido: " + type + ", id: " + tmdbId + ")");
+  var isMovie = type === "movie";
+  if (!tmdbId || (type !== "tv" && !isMovie)) {
+    trace("solo soporta series y peliculas (tipo recibido: " + type + ", id: " + tmdbId + ")");
     return diagnostic();
   }
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
-    var slug;
+    var slug, searchId = null;
     var direct = /^slug:([a-z0-9][a-z0-9\-]*)$/i.exec(String(tmdbId));
     if (direct) {
       slug = direct[1].toLowerCase();
       trace("slug directo: " + slug);
     } else {
-      var titles = await getTMDBTitles(tmdbId);
+      var titles = await getTMDBTitles(tmdbId, isMovie ? "movie" : "tv");
       if (!titles.length) { trace("TMDB sin titulos"); return diagnostic(); }
-      trace("TMDB: " + titles.slice(0, 2).join(" / ") + " (" + TMDB_YEAR + ") T" + seasonNum + "E" + episodeNum);
-      var found = await findSeriesSlug(titles);
-      if (!found) { trace("serie no encontrada en PelisGO"); return diagnostic(); }
+      trace("TMDB: " + titles.slice(0, 2).join(" / ") + " (" + TMDB_YEAR + ")" + (isMovie ? " pelicula" : " T" + seasonNum + "E" + episodeNum));
+      var found = await findSlug(titles, isMovie ? "movie" : "tv");
+      if (!found) { trace((isMovie ? "pelicula" : "serie") + " no encontrada en PelisGO"); return diagnostic(); }
       slug = found.slug;
-      trace("serie: " + slug + " (puntos " + found.score.toFixed(1) + ")");
+      searchId = found.id;
+      trace((isMovie ? "pelicula: " : "serie: ") + slug + " (puntos " + found.score.toFixed(1) + ")");
     }
-    var ep = await getEpisodeId(slug, seasonNum, episodeNum);
-    trace("episodeId " + ep.id);
-    var links = await getLinks(ep.id, ep.url);
+    var ep = isMovie ? await getMovieId(slug, searchId) : await getEpisodeId(slug, seasonNum, episodeNum);
+    trace((isMovie ? "movieId " : "episodeId ") + ep.id);
+    var links = await getLinks(ep.id, ep.url, isMovie);
     trace("servidores: " + links.map(function (l) { return l.server; }).join(","));
 
     var jobs = links.map(async function (lk) {
@@ -325,7 +342,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
             title: "",
             url: v.url,
             quality: "\uD83D\uDCFA " + source.label + (v.tag ? " (" + v.tag + ")" : "") + "\n" + (lk.quality || "1080p") + " | WEB-DL\n" + li.label +
-              "\n\uD83D\uDD17 T" + seasonNum + "E" + episodeNum + " \u00B7 " + ep.url,
+              "\n\uD83D\uDD17 " + (isMovie ? "" : "T" + seasonNum + "E" + episodeNum + " \u00B7 ") + ep.url,
             headers: v.headers,
             _lang: li.order,
             _rank: SERVER_ORDER.indexOf(key)
