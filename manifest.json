@@ -1,12 +1,12 @@
 {
   "name": "PelisGO",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "scrapers": [
     {
       "id": "PelisGO",
       "name": "PelisGO",
       "description": "Series y películas de pelisgo.online: Voe y Okru (HLS y MP4)",
-      "version": "1.3.4",
+      "version": "1.3.5",
       "filename": "providers/pelisgo.js",
       "supportedTypes": ["movie", "tv"],
       "enabled": true
