@@ -20,17 +20,14 @@ function withTimeout(promise, ms, label) {
     Promise.resolve(promise).then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
   });
 }
-function pgFetch(url, opts) { return withTimeout(_nativeFetch(url, opts), 5000, String(url).replace(/^https?:\/\//, "").split("/")[0]); }
+function pgFetch(url, opts) { return withTimeout(_nativeFetch(url, opts), 10000, String(url).replace(/^https?:\/\//, "").split("/")[0]); }
 
 var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
-var VERSION = "1.3.4";
+var VERSION = "1.3.3";
 var PROBE_QUALITY = true; // false = no leer la lista HLS para medir la calidad (mas rapido; usa solo el nombre de calidad de Okru)
-var PROBE_SOURCES = { Voe: false, Okru: true }; // true = leer la lista HLS para medir la resolucion de ese servidor
-var EXTRACT_TIMEOUT = { Voe: 8000, Okru: 5000 }; // ms maximos por extractor
-var GRACE_MS = 1200; // al llegar el primer servidor, espera esto por los demas y muestra
 var PROBE_MS = 0;
 var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
 var T0 = 0;
@@ -180,8 +177,8 @@ function qualityFromSize(w, h) {
 // Lee la lista maestra HLS y devuelve la resolucion mas alta que ofrece
 async function probeHls(url, headers) {
   try {
-    var r = await withTimeout(pgFetch(url, { headers: headers || { "User-Agent": UA } }), 1200, "hls");
-    var t = await withTimeout(r.text(), 1200, "hls");
+    var r = await withTimeout(pgFetch(url, { headers: headers || { "User-Agent": UA } }), 3000, "hls");
+    var t = await withTimeout(r.text(), 3000, "hls");
     var best = null, re = /RESOLUTION=(\d+)x(\d+)/g, m;
     while ((m = re.exec(t))) {
       var w = parseInt(m[1], 10), h = parseInt(m[2], 10);
@@ -192,7 +189,7 @@ async function probeHls(url, headers) {
 }
 async function describeQuality(v) {
   if (v.type === "hls") {
-    if (!PROBE_QUALITY || !PROBE_SOURCES[v.src]) return null;
+    if (!PROBE_QUALITY) return null;
     var r = await probeHls(v.url, v.headers);
     return r ? { label: qualityFromSize(r.w, r.h), size: r.w + "\u00D7" + r.h, exact: true } : null;
   }
@@ -410,20 +407,6 @@ function langInfo(l) {
   return { order: 3, label: String(l || "?").toUpperCase() };
 }
 
-// Devuelve en cuanto llega el primer resultado + GRACE_MS (o antes si todos terminan)
-function collect(jobs, graceMs) {
-  return new Promise(function (resolve) {
-    var out = [], pending = jobs.length, timer = null, done = false;
-    function finish() { if (done) return; done = true; if (timer) clearTimeout(timer); resolve(out); }
-    if (!pending) return finish();
-    jobs.forEach(function (j) {
-      j.then(function (arr) {
-        if (arr && !done) { out.push.apply(out, arr); if (!timer) timer = setTimeout(finish, graceMs); }
-      }).catch(function () { /* ya registrado en el job */ }).then(function () { if (--pending === 0) finish(); });
-    });
-  });
-}
-
 // ---------- punto de entrada ----------
 async function getStreamsInner(tmdbId, type, season, episode) {
   TRACE = [];
@@ -528,9 +511,8 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       if (!key) return null;
       var source = EXTRACTORS[key];
       try {
-        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), EXTRACT_TIMEOUT[key] || 7000, source.label);
+        var resolved = await withTimeout(source.extract(lk.url, { referer: ep.url }), 15000, source.label);
         var list = Array.isArray(resolved) ? resolved : [resolved];
-        list.forEach(function (v) { v.src = key; });
         var li = langInfo(lk.language);
         var qs = await qualitiesFor(list);
         return list.map(function (v, idx) {
@@ -556,7 +538,7 @@ async function getStreamsInner(tmdbId, type, season, episode) {
       }
     });
     var results = [];
-    results = await collect(jobs, GRACE_MS);
+    (await Promise.all(jobs)).filter(Boolean).forEach(function (arr) { results = results.concat(arr); });
     results.sort(function (a, b) { return a._lang !== b._lang ? a._lang - b._lang : a._rank - b._rank; });
     lap("extractores (calidad max " + PROBE_MS + "ms)");
     results.forEach(function (r, i) {
@@ -588,7 +570,7 @@ function diagnostic() {
 
 async function getStreams(tmdbId, type, season, episode) {
   try {
-    return await withTimeout(getStreamsInner(tmdbId, type, season, episode), 15000, "PelisGO");
+    return await withTimeout(getStreamsInner(tmdbId, type, season, episode), 45000, "PelisGO");
   } catch (e) {
     trace("global: " + shortErr(e));
     return diagnostic();
