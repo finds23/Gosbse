@@ -32,7 +32,7 @@ var PROBE_MS = 0;
 var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
 var T0 = 0;
 function lap(label) { trace(label + " +" + (Date.now() - T0) + "ms"); }
-var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
+var DEBUG = false; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
