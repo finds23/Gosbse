@@ -22,17 +22,19 @@ function withTimeout(promise, ms, label) {
 }
 function pgFetch(url, opts) { return withTimeout(_nativeFetch(url, opts), 10000, String(url).replace(/^https?:\/\//, "").split("/")[0]); }
 
+// Servidores que la pagina ofrece pero que NO funcionan y por eso no tienen extractor: KeKi, Filemoon y Doo.
+// Si algun dia se agrega un extractor nuevo, hay que anadirlo aqui y en EXTRACTORS / findSourceKey.
 var ENABLED_SOURCES = {
   Voe: true,   // puede dar 403 desde Render; fuera del addon funciona
   Okru: true   // solo reproduce si el video existe en ok.ru
 };
 var VERSION = "1.3.3";
-var PROBE_QUALITY = true; // false = no leer la lista HLS para medir la calidad (mas rapido; usa solo el nombre de calidad de Okru)
+var PROBE_QUALITY = false; // false = no leer la lista HLS para medir la calidad (mas rapido; usa solo el nombre de calidad de Okru)
 var PROBE_MS = 0;
-var TIMING = true; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
+var TIMING = false; // anade una entrada con los tiempos de cada paso (poner en false cuando ya no haga falta)
 var T0 = 0;
 function lap(label) { trace(label + " +" + (Date.now() - T0) + "ms"); }
-var DEBUG = true; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
+var DEBUG = false; // muestra una entrada DIAGNOSTICO si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
